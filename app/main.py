@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -25,6 +26,18 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+
+@app.on_event("startup")
+def init_indexes():
+    # employees collection indexes
+    db.employees.create_index("emp_code", unique=True)
+    db.employees.create_index("department")
+
+    # attendance_logs collection indexes
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    db.attendance_logs.create_index("date")
+    db.attendance_logs.create_index("status")
 
 
 # --------------------------------------------------------------------------- #
@@ -76,11 +89,12 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
     doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
     doc.pop("_id", None)
     return doc
 
