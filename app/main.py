@@ -44,10 +44,16 @@ def init_indexes():
 # Helpers
 # --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+    if punch_in.tzinfo is None:
+        punch_in = punch_in.replace(tzinfo=IST)
+    else:
+        punch_in = punch_in.astimezone(IST)
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+    total_seconds = (punch_in - start).total_seconds()
+    if total_seconds <= 600:
+        return 0
+    return int(total_seconds / 60)
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
