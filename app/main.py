@@ -10,6 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -43,11 +44,12 @@ def init_indexes():
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def ensure_ist(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=IST) if dt.tzinfo is None else dt.astimezone(IST)
+
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    if punch_in.tzinfo is None:
-        punch_in = punch_in.replace(tzinfo=IST)
-    else:
-        punch_in = punch_in.astimezone(IST)
+    punch_in = ensure_ist(punch_in)
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
     total_seconds = (punch_in - start).total_seconds()
@@ -57,7 +59,11 @@ def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    t1 = ensure_ist(punch_in)
+    t2 = ensure_ist(punch_out)
+    total_seconds = Decimal(str((t2 - t1).total_seconds()))
+    hours = total_seconds / Decimal(3600)
+    return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
