@@ -66,10 +66,16 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
+def compute_overtime(
+    punch_out: datetime, shift_end: str, date_str: str, shift_start: Optional[str] = None
+) -> int:
+    punch_out = ensure_ist(punch_out)
     h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, second=0, microsecond=0, tzinfo=IST)
+    if (shift_start and shift_end <= shift_start) or (shift_start is None and punch_out.date() > end.date()):
+        end += timedelta(days=1)
+    minutes = int((punch_out - end).total_seconds() / 60)
+    return minutes if minutes >= 30 else 0
 
 
 # --------------------------------------------------------------------------- #
