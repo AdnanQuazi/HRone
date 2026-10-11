@@ -102,6 +102,10 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        client.admin.command("ping")
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database unavailable")
     return {"status": "ok"}
 
 
