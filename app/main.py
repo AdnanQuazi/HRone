@@ -112,7 +112,7 @@ def health():
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
+    doc["created_at"] = datetime.now(timezone.utc)
     try:
         db.employees.insert_one(doc)
     except DuplicateKeyError:
