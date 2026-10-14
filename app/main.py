@@ -14,7 +14,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
@@ -39,6 +39,7 @@ def init_indexes():
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     db.attendance_logs.create_index("date")
     db.attendance_logs.create_index("status")
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
 
 
 # --------------------------------------------------------------------------- #
@@ -46,6 +47,39 @@ def init_indexes():
 # --------------------------------------------------------------------------- #
 def ensure_ist(dt: datetime) -> datetime:
     return dt.replace(tzinfo=IST) if dt.tzinfo is None else dt.astimezone(IST)
+
+
+def format_attendance_doc(d: dict) -> dict:
+    for field in ("punch_in", "punch_out"):
+        val = d.get(field)
+        if isinstance(val, datetime):
+            if val.tzinfo is None:
+                val = val.replace(tzinfo=timezone.utc)
+            d[field] = int(val.timestamp() * 1000)
+    d.setdefault("work_hours", None)
+    d.setdefault("late_minutes", 0)
+    d.setdefault("overtime_minutes", 0)
+    d.setdefault("half_day", False)
+    history = d.get("history") or []
+    for h in history:
+        if isinstance(h.get("at"), datetime):
+            hat = h["at"]
+            if hat.tzinfo is None:
+                hat = hat.replace(tzinfo=timezone.utc)
+            h["at"] = int(hat.timestamp() * 1000)
+        changes = h.get("changes") or {}
+        for f in ("punch_in", "punch_out"):
+            if f in changes:
+                ch = changes[f]
+                for k in ("from", "to"):
+                    c_val = ch.get(k)
+                    if isinstance(c_val, datetime):
+                        if c_val.tzinfo is None:
+                            c_val = c_val.replace(tzinfo=timezone.utc)
+                        ch[k] = int(c_val.timestamp() * 1000)
+    d["history"] = history
+    d.pop("_id", None)
+    return d
 
 
 def compute_late_minutes(punch_in: datetime, shift_start: str, date_str: Optional[str] = None) -> int:
@@ -191,10 +225,16 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
+    p = page if isinstance(page, int) else getattr(page, "default", 1)
+    ps = page_size if isinstance(page_size, int) else getattr(page_size, "default", 20)
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from must be on or before date_to")
+
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
@@ -206,13 +246,17 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+    skip = (p - 1) * ps
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q, {"_id": 0})
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip(skip)
+        .limit(ps)
+    )
+    items = [format_attendance_doc(d) for d in cursor]
+    return {"items": items, "total": total, "page": p, "page_size": ps}
 
 
 # --------------------------------------------------------------------------- #
