@@ -49,34 +49,54 @@ def ensure_ist(dt: datetime) -> datetime:
     return dt.replace(tzinfo=IST) if dt.tzinfo is None else dt.astimezone(IST)
 
 
+def dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
+    if not isinstance(dt, datetime):
+        return dt
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def parse_epoch_ms(ms: Optional[int]) -> datetime:
+    if ms is None:
+        return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).replace(microsecond=0)
+
+
+def get_shift_datetime(date_str: str, time_str: str, next_day: bool = False) -> datetime:
+    h, m = map(int, time_str.split(":"))
+    dt = datetime.fromisoformat(date_str).replace(hour=h, minute=m, second=0, microsecond=0, tzinfo=IST)
+    if next_day:
+        dt += timedelta(days=1)
+    return dt
+
+
+def determine_attendance_date(ts_ist: datetime, shift_start: str, shift_end: str) -> str:
+    end_h, end_m = map(int, shift_end.split(":"))
+    if shift_end <= shift_start and (ts_ist.hour, ts_ist.minute) < (end_h, end_m):
+        return (ts_ist.date() - timedelta(days=1)).isoformat()
+    return ts_ist.date().isoformat()
+
+
 def format_attendance_doc(d: dict) -> dict:
     for field in ("punch_in", "punch_out"):
-        val = d.get(field)
-        if isinstance(val, datetime):
-            if val.tzinfo is None:
-                val = val.replace(tzinfo=timezone.utc)
-            d[field] = int(val.timestamp() * 1000)
+        if field in d:
+            d[field] = dt_to_epoch_ms(d[field])
     d.setdefault("work_hours", None)
     d.setdefault("late_minutes", 0)
     d.setdefault("overtime_minutes", 0)
     d.setdefault("half_day", False)
     history = d.get("history") or []
     for h in history:
-        if isinstance(h.get("at"), datetime):
-            hat = h["at"]
-            if hat.tzinfo is None:
-                hat = hat.replace(tzinfo=timezone.utc)
-            h["at"] = int(hat.timestamp() * 1000)
+        if "at" in h:
+            h["at"] = dt_to_epoch_ms(h["at"])
         changes = h.get("changes") or {}
         for f in ("punch_in", "punch_out"):
             if f in changes:
                 ch = changes[f]
                 for k in ("from", "to"):
-                    c_val = ch.get(k)
-                    if isinstance(c_val, datetime):
-                        if c_val.tzinfo is None:
-                            c_val = c_val.replace(tzinfo=timezone.utc)
-                        ch[k] = int(c_val.timestamp() * 1000)
+                    if k in ch:
+                        ch[k] = dt_to_epoch_ms(ch[k])
     d["history"] = history
     d.pop("_id", None)
     return d
@@ -84,10 +104,10 @@ def format_attendance_doc(d: dict) -> dict:
 
 def compute_late_minutes(punch_in: datetime, shift_start: str, date_str: Optional[str] = None) -> int:
     punch_in = ensure_ist(punch_in)
-    h, m = map(int, shift_start.split(":"))
     if date_str:
-        start = datetime.fromisoformat(date_str).replace(hour=h, minute=m, second=0, microsecond=0, tzinfo=IST)
+        start = get_shift_datetime(date_str, shift_start)
     else:
+        h, m = map(int, shift_start.split(":"))
         start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
         if (punch_in - start).total_seconds() < -12 * 3600:
             start -= timedelta(days=1)
@@ -109,12 +129,37 @@ def compute_overtime(
     punch_out: datetime, shift_end: str, date_str: str, shift_start: Optional[str] = None
 ) -> int:
     punch_out = ensure_ist(punch_out)
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, second=0, microsecond=0, tzinfo=IST)
-    if (shift_start and shift_end <= shift_start) or (shift_start is None and punch_out.date() > end.date()):
+    is_overnight = shift_start and shift_end <= shift_start
+    end = get_shift_datetime(date_str, shift_end, next_day=bool(is_overnight))
+    if not shift_start and punch_out.date() > end.date():
         end += timedelta(days=1)
     minutes = int((punch_out - end).total_seconds() / 60)
     return minutes if minutes >= 30 else 0
+
+
+def compute_derived_attendance(
+    punch_in: Optional[datetime],
+    punch_out: Optional[datetime],
+    shift_start: str,
+    shift_end: str,
+    date_str: str,
+) -> dict:
+    late_mins = compute_late_minutes(punch_in, shift_start, date_str) if punch_in else 0
+    if not punch_in or not punch_out:
+        return {
+            "late_minutes": late_mins,
+            "work_hours": None,
+            "overtime_minutes": 0,
+            "half_day": False,
+        }
+    wh = compute_work_hours(punch_in, punch_out)
+    ot = compute_overtime(punch_out, shift_end, date_str, shift_start)
+    return {
+        "late_minutes": late_mins,
+        "work_hours": wh,
+        "overtime_minutes": ot,
+        "half_day": wh < 4.50,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -177,23 +222,12 @@ def punch_in(body: PunchInIn):
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    ts = (
-        datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc)
-        if body.punched_at
-        else datetime.now(timezone.utc)
-    ).replace(microsecond=0)
+    ts = parse_epoch_ms(body.punched_at)
     ts_ist = ts.astimezone(IST)
 
     shift_start = emp.get("shift_start", "09:30")
     shift_end = emp.get("shift_end", "18:30")
-    end_h, end_m = map(int, shift_end.split(":"))
-
-    # R1: Overnight shift (shift_end <= shift_start): punch-in earlier than shift_end belongs to previous day
-    if shift_end <= shift_start and (ts_ist.hour, ts_ist.minute) < (end_h, end_m):
-        d = (ts_ist.date() - timedelta(days=1)).isoformat()
-    else:
-        d = ts_ist.date().isoformat()
-
+    d = determine_attendance_date(ts_ist, shift_start, shift_end)
     late_mins = compute_late_minutes(ts_ist, shift_start, d)
 
     doc = {
@@ -214,10 +248,7 @@ def punch_in(body: PunchInIn):
     except DuplicateKeyError:
         raise HTTPException(status_code=409, detail="already punched in for this date")
 
-    # Contract: no _id/id and punch_in as epoch milliseconds
-    doc.pop("_id", None)
-    doc["punch_in"] = int(ts.timestamp() * 1000)
-    return doc
+    return format_attendance_doc(doc)
 
 
 @app.get("/attendance")
@@ -229,9 +260,6 @@ def list_attendance(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
-    p = page if isinstance(page, int) else getattr(page, "default", 1)
-    ps = page_size if isinstance(page_size, int) else getattr(page_size, "default", 20)
-
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=422, detail="date_from must be on or before date_to")
 
@@ -247,16 +275,16 @@ def list_attendance(
     if status:
         q["status"] = status
 
-    skip = (p - 1) * ps
+    skip = (page - 1) * page_size
     total = db.attendance_logs.count_documents(q)
     cursor = (
         db.attendance_logs.find(q, {"_id": 0})
         .sort([("date", -1), ("emp_code", 1)])
         .skip(skip)
-        .limit(ps)
+        .limit(page_size)
     )
     items = [format_attendance_doc(d) for d in cursor]
-    return {"items": items, "total": total, "page": p, "page_size": ps}
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
