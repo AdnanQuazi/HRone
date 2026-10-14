@@ -11,11 +11,11 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
@@ -48,10 +48,15 @@ def ensure_ist(dt: datetime) -> datetime:
     return dt.replace(tzinfo=IST) if dt.tzinfo is None else dt.astimezone(IST)
 
 
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+def compute_late_minutes(punch_in: datetime, shift_start: str, date_str: Optional[str] = None) -> int:
     punch_in = ensure_ist(punch_in)
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
+    if date_str:
+        start = datetime.fromisoformat(date_str).replace(hour=h, minute=m, second=0, microsecond=0, tzinfo=IST)
+    else:
+        start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
+        if (punch_in - start).total_seconds() < -12 * 3600:
+            start -= timedelta(days=1)
     total_seconds = (punch_in - start).total_seconds()
     if total_seconds <= 600:
         return 0
@@ -93,8 +98,8 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[int] = Field(default=None, ge=100_000_000_000, le=4_102_444_800_000)
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #
@@ -135,10 +140,28 @@ def list_employees(department: Optional[str] = None, page: int = 1, page_size: i
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    ts = (
+        datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc)
+        if body.punched_at
+        else datetime.now(timezone.utc)
+    ).replace(microsecond=0)
+    ts_ist = ts.astimezone(IST)
+
+    shift_start = emp.get("shift_start", "09:30")
+    shift_end = emp.get("shift_end", "18:30")
+    end_h, end_m = map(int, shift_end.split(":"))
+
+    # R1: Overnight shift (shift_end <= shift_start): punch-in earlier than shift_end belongs to previous day
+    if shift_end <= shift_start and (ts_ist.hour, ts_ist.minute) < (end_h, end_m):
+        d = (ts_ist.date() - timedelta(days=1)).isoformat()
+    else:
+        d = ts_ist.date().isoformat()
+
+    late_mins = compute_late_minutes(ts_ist, shift_start, d)
+
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -146,14 +169,20 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": late_mins,
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
+
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="already punched in for this date")
+
+    # Contract: no _id/id and punch_in as epoch milliseconds
     doc.pop("_id", None)
+    doc["punch_in"] = int(ts.timestamp() * 1000)
     return doc
 
 
