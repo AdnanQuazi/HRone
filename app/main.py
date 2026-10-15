@@ -16,6 +16,7 @@ from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field, model_validator
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
@@ -1134,7 +1135,141 @@ def department_trend(
     return {"department": department, "items": items}
 
 
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: Literal[
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    ] = Path(...),
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+    limit: int = Query(default=10, ge=1, le=50),
+    date_from: Optional[str] = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    date_to: Optional[str] = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    from_date: Optional[str] = Query(default=None, alias="from", pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    to_date: Optional[str] = Query(default=None, alias="to", pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    if endpoint == "attendance_list":
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(status_code=422, detail="date_from must be on or before date_to")
+        q = {}
+        if emp_code:
+            q["emp_code"] = emp_code
+        if date_from or date_to:
+            q["date"] = {}
+            if date_from:
+                q["date"]["$gte"] = date_from
+            if date_to:
+                q["date"]["$lte"] = date_to
+        if status:
+            q["status"] = status
+        skip = (page - 1) * page_size
+        sort_spec = [("date", -1), ("emp_code", 1)]
+        plan = db.command(
+            "explain",
+            {
+                "find": "attendance_logs",
+                "filter": q,
+                "projection": {"_id": 0},
+                "sort": dict(sort_spec),
+                "skip": skip,
+                "limit": page_size,
+            },
+            verbosity="executionStats",
+        )
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": jsonable_encoder(plan),
+        }
+
+    elif endpoint == "employee_monthly":
+        if not emp_code or not month:
+            raise HTTPException(status_code=422, detail="emp_code and month are required for employee_monthly")
+        pipeline = build_employee_monthly_pipeline(emp_code, month)
+        plan = db.command(
+            "explain",
+            {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            verbosity="executionStats",
+        )
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": jsonable_encoder(plan),
+        }
+
+    elif endpoint == "department_summary":
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required for department_summary")
+        pipeline = build_department_summary_pipeline(month, department)
+        plan = db.command(
+            "explain",
+            {
+                "aggregate": "employees",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            verbosity="executionStats",
+        )
+        return {
+            "endpoint": endpoint,
+            "collection": "employees",
+            "explain": jsonable_encoder(plan),
+        }
+
+    elif endpoint == "late_leaderboard":
+        if not month:
+            raise HTTPException(status_code=422, detail="month is required for late_leaderboard")
+        pipeline = build_late_leaderboard_pipeline(month, limit, department)
+        plan = db.command(
+            "explain",
+            {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            verbosity="executionStats",
+        )
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": jsonable_encoder(plan),
+        }
+
+    elif endpoint == "department_trend":
+        if not department:
+            raise HTTPException(status_code=422, detail="department is required for department_trend")
+        if not from_date or not to_date:
+            raise HTTPException(status_code=422, detail="'from' and 'to' dates are required for department_trend")
+        d_from = date.fromisoformat(from_date)
+        d_to = date.fromisoformat(to_date)
+        if d_to < d_from:
+            raise HTTPException(status_code=422, detail="'to' date must be on or after 'from' date")
+        if (d_to - d_from).days + 1 > 92:
+            raise HTTPException(status_code=422, detail="Date range cannot exceed 92 days")
+        pipeline = build_department_trend_pipeline(department, from_date, to_date)
+        plan = db.command(
+            "explain",
+            {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            verbosity="executionStats",
+        )
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": jsonable_encoder(plan),
+        }
