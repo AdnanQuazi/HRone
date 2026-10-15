@@ -16,7 +16,7 @@ from typing import Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
@@ -40,13 +40,16 @@ def init_indexes():
     db.attendance_logs.create_index("date")
     db.attendance_logs.create_index("status")
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def ensure_ist(dt: datetime) -> datetime:
-    return dt.replace(tzinfo=IST) if dt.tzinfo is None else dt.astimezone(IST)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
 
 
 def dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
@@ -120,7 +123,7 @@ def compute_late_minutes(punch_in: datetime, shift_start: str, date_str: Optiona
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     t1 = ensure_ist(punch_in)
     t2 = ensure_ist(punch_out)
-    total_seconds = Decimal(str((t2 - t1).total_seconds()))
+    total_seconds = Decimal(str(int((t2 - t1).total_seconds())))
     hours = total_seconds / Decimal(3600)
     return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
@@ -179,6 +182,11 @@ class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = Field(default=None, ge=100_000_000_000, le=4_102_444_800_000)
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[int] = Field(default=None, ge=100_000_000_000, le=4_102_444_800_000)
 
 
 # --------------------------------------------------------------------------- #
@@ -287,9 +295,68 @@ def list_attendance(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    ts = parse_epoch_ms(body.punched_at)
+
+    latest = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None}},
+        sort=[("punch_in", -1)],
+    )
+    if not latest:
+        raise HTTPException(status_code=404, detail="No punch-in found")
+
+    record_in = latest["punch_in"]
+    if record_in.tzinfo is None:
+        record_in = record_in.replace(tzinfo=timezone.utc)
+
+    if ts <= record_in:
+        raise HTTPException(status_code=422, detail="punched_at must be strictly after punch_in")
+
+    if (ts - record_in).total_seconds() > 24 * 3600:
+        raise HTTPException(status_code=422, detail="punched_at cannot be more than 24 hours after punch_in")
+
+    if latest.get("punch_out") is not None:
+        raise HTTPException(status_code=409, detail="Attendance record is already punched out")
+
+    shift_start = emp.get("shift_start", "09:30")
+    shift_end = emp.get("shift_end", "18:30")
+    derived = compute_derived_attendance(
+        record_in,
+        ts,
+        shift_start,
+        shift_end,
+        latest["date"],
+    )
+
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": latest["_id"],
+            "punch_out": None,
+        },
+        {
+            "$set": {
+                "punch_out": ts,
+                "work_hours": derived["work_hours"],
+                "overtime_minutes": derived["overtime_minutes"],
+                "half_day": derived["half_day"],
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not updated:
+        raise HTTPException(status_code=409, detail="Attendance record is already punched out")
+
+    return format_attendance_doc(updated)
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
