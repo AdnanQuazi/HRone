@@ -15,7 +15,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
@@ -273,6 +273,14 @@ class PunchOutIn(BaseModel):
     punched_at: Optional[int] = Field(default=None, ge=100_000_000_000, le=4_102_444_800_000)
 
 
+class RegularizeIn(BaseModel):
+    reason: str = Field(..., min_length=5, max_length=200)
+    regularized_by: str = Field(..., min_length=1, max_length=50)
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in: Optional[int] = Field(default=None, ge=100_000_000_000, le=4_102_444_800_000)
+    punch_out: Optional[int] = Field(default=None, ge=100_000_000_000, le=4_102_444_800_000)
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
@@ -486,9 +494,180 @@ def employee_monthly(
     }
 
 
+@app.patch("/attendance/{emp_code}/{date}", status_code=200)
+def regularize_attendance(
+    emp_code: str = Path(...),
+    date: str = Path(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$"),
+    body: RegularizeIn = ...,
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not record:
+        raise HTTPException(status_code=404, detail="Attendance record not found for this date")
+
+    old_status = record.get("status")
+    old_punch_in = record.get("punch_in")
+    old_punch_out = record.get("punch_out")
+    if isinstance(old_punch_in, datetime) and old_punch_in.tzinfo is None:
+        old_punch_in = old_punch_in.replace(tzinfo=timezone.utc)
+    if isinstance(old_punch_out, datetime) and old_punch_out.tzinfo is None:
+        old_punch_out = old_punch_out.replace(tzinfo=timezone.utc)
+
+    old_late_minutes = record.get("late_minutes", 0)
+    old_work_hours = record.get("work_hours", None)
+    old_overtime_minutes = record.get("overtime_minutes", 0)
+    old_half_day = record.get("half_day", False)
+
+    new_status = body.status if body.status is not None else old_status
+
+    # Rule 1: setting status ABSENT or LEAVE clears both punch times,
+    # so supplying punch_in or punch_out with it is 422
+    if body.status in ("ABSENT", "LEAVE") and (body.punch_in is not None or body.punch_out is not None):
+        raise HTTPException(
+            status_code=422,
+            detail="Supplying punch_in or punch_out when setting status ABSENT or LEAVE is not allowed",
+        )
+    if new_status in ("ABSENT", "LEAVE") and (body.punch_in is not None or body.punch_out is not None):
+        raise HTTPException(
+            status_code=422,
+            detail="Punch times not allowed for ABSENT or LEAVE status",
+        )
+
+    if new_status in ("ABSENT", "LEAVE"):
+        new_punch_in = None
+        new_punch_out = None
+    else:
+        new_punch_in = parse_epoch_ms(body.punch_in) if body.punch_in is not None else old_punch_in
+        new_punch_out = parse_epoch_ms(body.punch_out) if body.punch_out is not None else old_punch_out
+
+    # Rule 2: a presence status requires a punch_in (supplied or already stored)
+    if new_status in ("PRESENT", "WFH", "ON_DUTY") and new_punch_in is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Presence status requires a punch_in",
+        )
+
+    shift_start = emp.get("shift_start", "09:30")
+    shift_end = emp.get("shift_end", "18:30")
+
+    # Rule 3: punch_in must stay on the record's attendance date (R1)
+    if new_punch_in is not None:
+        punch_in_ist = new_punch_in.astimezone(IST)
+        calc_date = determine_attendance_date(punch_in_ist, shift_start, shift_end)
+        if calc_date != date:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in must stay on the record's attendance date",
+            )
+
+    # Rule 4: punch_out must be after punch_in and within 24 hours
+    if new_punch_out is not None:
+        if new_punch_in is None or new_punch_out <= new_punch_in:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_out must be strictly after punch_in",
+            )
+        if (new_punch_out - new_punch_in).total_seconds() > 24 * 3600:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_out cannot be more than 24 hours after punch_in",
+            )
+
+    # Recompute derived fields (R2-R5)
+    if new_status in ("ABSENT", "LEAVE"):
+        new_late_minutes = 0
+        new_work_hours = None
+        new_overtime_minutes = 0
+        new_half_day = False
+    else:
+        derived = compute_derived_attendance(
+            new_punch_in,
+            new_punch_out,
+            shift_start,
+            shift_end,
+            date,
+        )
+        new_late_minutes = derived["late_minutes"]
+        new_work_hours = derived["work_hours"]
+        new_overtime_minutes = derived["overtime_minutes"]
+        new_half_day = derived["half_day"]
+
+    # Detect actually changed fields
+    changes = {}
+    if new_status != old_status:
+        changes["status"] = {"from": old_status, "to": new_status}
+    if new_punch_in != old_punch_in:
+        changes["punch_in"] = {"from": old_punch_in, "to": new_punch_in}
+    if new_punch_out != old_punch_out:
+        changes["punch_out"] = {"from": old_punch_out, "to": new_punch_out}
+    if new_work_hours != old_work_hours:
+        changes["work_hours"] = {"from": old_work_hours, "to": new_work_hours}
+    if new_late_minutes != old_late_minutes:
+        changes["late_minutes"] = {"from": old_late_minutes, "to": new_late_minutes}
+    if new_overtime_minutes != old_overtime_minutes:
+        changes["overtime_minutes"] = {"from": old_overtime_minutes, "to": new_overtime_minutes}
+    if new_half_day != old_half_day:
+        changes["half_day"] = {"from": old_half_day, "to": new_half_day}
+
+    # Rule 5: a request that changes nothing is 422
+    if not changes:
+        raise HTTPException(status_code=422, detail="Request changes nothing")
+
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    history_entry = {
+        "at": now_utc,
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    # Optimistic concurrency control to prevent losing history
+    hist_len = len(record.get("history") or [])
+    if "history" not in record or record["history"] is None:
+        filter_q = {
+            "_id": record["_id"],
+            "$or": [{"history": {"$exists": False}}, {"history": {"$size": 0}}],
+        }
+    else:
+        filter_q = {
+            "_id": record["_id"],
+            "history": {"$size": hist_len},
+        }
+
+    update_doc = {
+        "$set": {
+            "status": new_status,
+            "punch_in": new_punch_in,
+            "punch_out": new_punch_out,
+            "late_minutes": new_late_minutes,
+            "work_hours": new_work_hours,
+            "overtime_minutes": new_overtime_minutes,
+            "half_day": new_half_day,
+        },
+        "$push": {
+            "history": history_entry,
+        },
+    }
+
+    updated = db.attendance_logs.find_one_and_update(
+        filter_q,
+        update_doc,
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=409,
+            detail="Concurrent regularization detected; please retry with the updated record",
+        )
+
+    return format_attendance_doc(updated)
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
