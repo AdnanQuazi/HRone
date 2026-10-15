@@ -8,8 +8,9 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+import calendar
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional
 
@@ -163,6 +164,89 @@ def compute_derived_attendance(
         "overtime_minutes": ot,
         "half_day": wh < 4.50,
     }
+
+
+def compute_working_days(joined_on_str: str, month_str: str) -> int:
+    year, mon = map(int, month_str.split("-"))
+    _, num_days = calendar.monthrange(year, mon)
+    first_day = date(year, mon, 1)
+    last_day = date(year, mon, num_days)
+
+    joined_on = date.fromisoformat(joined_on_str)
+    if joined_on > last_day:
+        return 0
+
+    cur = max(first_day, joined_on)
+    count = 0
+    while cur <= last_day:
+        if cur.weekday() < 5:
+            count += 1
+        cur += timedelta(days=1)
+    return count
+
+
+def build_employee_monthly_pipeline(emp_code: str, month_str: str) -> list[dict]:
+    year, mon = map(int, month_str.split("-"))
+    _, num_days = calendar.monthrange(year, mon)
+    start_date = f"{month_str}-01"
+    end_date = f"{month_str}-{num_days:02d}"
+
+    return [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {"$gte": start_date, "$lte": end_date},
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {
+                                        "$lte": [
+                                            {
+                                                "$isoDayOfWeek": {
+                                                    "$dateFromString": {"dateString": "$date"}
+                                                }
+                                            },
+                                            5,
+                                        ]
+                                    },
+                                ]
+                            },
+                            {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1.0]},
+                            0.0,
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$status", "LEAVE"]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+            }
+        },
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -355,10 +439,56 @@ def punch_out(body: PunchOutIn):
     return format_attendance_doc(updated)
 
 
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    pipeline = build_employee_monthly_pipeline(emp_code, month)
+    res = list(db.attendance_logs.aggregate(pipeline))
+
+    if res:
+        data = res[0]
+        present_days = float(data.get("present_days", 0.0))
+        leave_days = int(data.get("leave_days", 0))
+        late_count = int(data.get("late_count", 0))
+        total_late_minutes = int(data.get("total_late_minutes", 0))
+        total_overtime_minutes = int(data.get("total_overtime_minutes", 0))
+    else:
+        present_days = 0.0
+        leave_days = 0
+        late_count = 0
+        total_late_minutes = 0
+        total_overtime_minutes = 0
+
+    working_days = compute_working_days(emp["joined_on"], month)
+
+    if working_days > 0:
+        raw_pct = (Decimal(str(present_days)) / Decimal(working_days)) * Decimal(100)
+        attendance_pct = float(raw_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    else:
+        attendance_pct = None
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late_minutes,
+        "total_overtime_minutes": total_overtime_minutes,
+        "attendance_pct": attendance_pct,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
