@@ -44,6 +44,7 @@ def init_indexes():
     db.attendance_logs.create_index("status")
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
+    db.attendance_logs.create_index([("date", 1), ("late_minutes", 1), ("emp_code", 1)])
 
 
 # --------------------------------------------------------------------------- #
@@ -398,6 +399,68 @@ def build_department_summary_pipeline(month_str: str, department: Optional[str] 
         },
         {"$sort": {"department": 1}},
     ]
+
+
+def build_late_leaderboard_pipeline(
+    month_str: str, limit: int = 10, department: Optional[str] = None
+) -> list[dict]:
+    year, mon = map(int, month_str.split("-"))
+    _, num_days = calendar.monthrange(year, mon)
+    start_date = f"{month_str}-01"
+    end_date = f"{month_str}-{num_days:02d}"
+
+    pipeline = [
+        {
+            "$match": {
+                "date": {"$gte": start_date, "$lte": end_date},
+                "late_minutes": {"$gt": 0},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "late_count": {"$sum": 1},
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "_id",
+                "foreignField": "emp_code",
+                "as": "emp",
+            }
+        },
+        {"$unwind": "$emp"},
+    ]
+
+    if department:
+        pipeline.append({"$match": {"emp.department": department}})
+
+    pipeline.extend([
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {
+                    "rank": {"$rank": {}}
+                }
+            }
+        },
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {
+            "$project": {
+                "_id": 0,
+                "rank": 1,
+                "emp_code": "$_id",
+                "name": "$emp.name",
+                "department": "$emp.department",
+                "total_late_minutes": 1,
+                "late_count": 1,
+            }
+        },
+    ])
+    return pipeline
 
 
 # --------------------------------------------------------------------------- #
@@ -856,9 +919,19 @@ def department_summary(
     return {"month": month, "items": items}
 
 
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(default=10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    pipeline = build_late_leaderboard_pipeline(month, limit, department)
+    items = list(db.attendance_logs.aggregate(pipeline))
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
