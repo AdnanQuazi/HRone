@@ -35,6 +35,8 @@ def init_indexes():
     # employees collection indexes
     db.employees.create_index("emp_code", unique=True)
     db.employees.create_index("department")
+    db.employees.create_index("joined_on")
+    db.employees.create_index([("department", 1), ("joined_on", 1)])
 
     # attendance_logs collection indexes
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
@@ -246,6 +248,148 @@ def build_employee_monthly_pipeline(emp_code: str, month_str: str) -> list[dict]
                 "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
             }
         },
+    ]
+
+
+def build_department_summary_pipeline(month_str: str, department: Optional[str] = None) -> list[dict]:
+    year, mon = map(int, month_str.split("-"))
+    _, num_days = calendar.monthrange(year, mon)
+    start_date = f"{month_str}-01"
+    end_date = f"{month_str}-{num_days:02d}"
+
+    match_filter = {"joined_on": {"$lte": end_date}}
+    if department:
+        match_filter["department"] = department
+
+    return [
+        {"$match": match_filter},
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"emp": "$emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$emp_code", "$$emp"]},
+                                    {"$gte": ["$date", start_date]},
+                                    {"$lte": ["$date", end_date]},
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "as": "logs",
+            }
+        },
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
+        {
+            "$group": {
+                "_id": "$department",
+                "employees": {"$addToSet": "$emp_code"},
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {
+                                        "$lte": [
+                                            {
+                                                "$isoDayOfWeek": {
+                                                    "$dateFromString": {"dateString": "$logs.date"}
+                                                }
+                                            },
+                                            5,
+                                        ]
+                                    },
+                                ]
+                            },
+                            {"$cond": [{"$ifNull": ["$logs.half_day", False]}, 0.5, 1.0]},
+                            0.0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$logs.late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$logs.late_minutes", 0]}
+                },
+                "leave_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$logs.status", "LEAVE"]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "on_duty_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$logs.status", "ON_DUTY"]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "sum_work_hours": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$ne": ["$logs.work_hours", None]},
+                                ]
+                            },
+                            "$logs.work_hours",
+                            0.0,
+                        ]
+                    }
+                },
+                "count_work_hours": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$ne": ["$logs.work_hours", None]},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "department": "$_id",
+                "headcount": {"$size": "$employees"},
+                "present_days": 1,
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "leave_count": 1,
+                "on_duty_count": 1,
+                "avg_work_hours": {
+                    "$cond": [
+                        {"$gt": ["$count_work_hours", 0]},
+                        {"$divide": ["$sum_work_hours", "$count_work_hours"]},
+                        None,
+                    ]
+                },
+            }
+        },
+        {"$sort": {"department": 1}},
     ]
 
 
@@ -666,9 +810,37 @@ def regularize_attendance(
     return format_attendance_doc(updated)
 
 
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+):
+    pipeline = build_department_summary_pipeline(month, department)
+    cursor = db.employees.aggregate(pipeline)
+
+    items = []
+    for doc in cursor:
+        avg_wh = doc.get("avg_work_hours")
+        if avg_wh is not None:
+            raw_dec = Decimal(str(avg_wh))
+            avg_wh = float(raw_dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+        items.append({
+            "department": doc["department"],
+            "headcount": int(doc["headcount"]),
+            "present_days": float(doc.get("present_days", 0.0)),
+            "avg_work_hours": avg_wh,
+            "late_count": int(doc.get("late_count", 0)),
+            "total_late_minutes": int(doc.get("total_late_minutes", 0)),
+            "leave_count": int(doc.get("leave_count", 0)),
+            "on_duty_count": int(doc.get("on_duty_count", 0)),
+        })
+
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
